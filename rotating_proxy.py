@@ -1,67 +1,69 @@
-import logging
 import requests
 
 from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
 from random import shuffle
 
-LOGGER = logging.getLogger(__name__)
-LOGGER.addHandler(logging.NullHandler())
-
-PROXY_SOURCE = 'https://www.sslproxies.org/'
-
-
-# TODO: to class and get parameters for proxy_source + proxy_source_parsing_func
-
-class DepletedProxyPoolException(Exception):
+class DepletedProxyPoolException(RuntimeError):
     pass
+class RotatingProxy:
+    DEFAULT_PROXY_SOURCE = 'https://www.sslproxies.org/'
 
+    @staticmethod
+    def _default_proxy_source_parser(link):
+        response = requests.get(link)
+        soup = BeautifulSoup(response.text, "lxml")
+        https_proxies = filter(lambda item: "yes" in item.text,
+                            soup.select("table.table tr"))
+        for item in https_proxies:
+            yield "{}:{}".format(item.select_one("td").text,
+                                item.select_one("td:nth-of-type(2)").text)
 
-def get_proxies(link):
-    response = requests.get(link)
-    soup = BeautifulSoup(response.text, "lxml")
-    https_proxies = filter(lambda item: "yes" in item.text,
-                           soup.select("table.table tr"))
-    for item in https_proxies:
-        yield "{}:{}".format(item.select_one("td").text,
-                             item.select_one("td:nth-of-type(2)").text)
+    def __init__(self, proxy_source=DEFAULT_PROXY_SOURCE, 
+                proxy_source_parser=_default_proxy_source_parser.__func__):
+        """ Constructs object using a proxy source url and a proxy url parser function
+        @param proxy_source url which contains proxies
+        @param proxy_source_parser function to parse the url and return a list of proxies as strings
+         """
+        self.proxy_source = proxy_source
+        self.proxy_source_parser = proxy_source_parser
+        self.proxies = None
 
+    def _get_random_proxies_iter(self):
+        proxies = list(self.proxy_source_parser(self.proxy_source))
+        print('Got {} proxies to use'.format(len(proxies)))
+        shuffle(proxies)
+        return iter(proxies)  # iter so we can call next on it to get the next proxy
 
-def get_random_proxies_iter():
-    proxies = list(get_proxies(PROXY_SOURCE))
-    LOGGER.info('Got {} proxies to use'.format(len(proxies)))
-    shuffle(proxies)
-    return iter(proxies)  # iter so we can call next on it to get the next proxy
+    def get_proxy(self, validate=False):
+        if not self.proxies:
+            self.proxies = self._get_random_proxies_iter()
 
-
-def get_proxy(session, proxies, validated=False):
-    # TODO: handle StopIteration exception
-    session.proxies = {'https': 'https://{}'.format(next(proxies))}
-    if validated:
-        while True:
-            try:
-                LOGGER.debug('Validating {}'.format(session.proxies['https']))
-                session.get('https://httpbin.org/ip', timeout=30)
-                return session
-            except Exception:
-                session.proxies = {'https': 'https://{}'.format(next(proxies))}
-
+        try:
+            proxy = next(self.proxies)
+            if validate:
+                session = requests.Session()
+                while True:
+                    try:
+                        session.proxies = {'https': 'https://{}'.format(proxy)}
+                        print('Validating {}'.format(session.proxies['https']))
+                        session.get('https://httpbin.org/ip', timeout=30)
+                        return proxy
+                    except Exception:
+                        proxy = next(self.proxies)
+        except StopIteration as _:
+            raise DepletedProxyPoolException('Ran out of proxies to rotate')
 
 if __name__ == '__main__':
-    url = input('Input url: ')
-    session = requests.Session()
-    ua = UserAgent()
-    proxies = get_random_proxies_iter()
+    rotating_proxy = RotatingProxy()
     while True:
         try:
-            session.headers = {'User-Agent': ua.random}
-            # collect a working proxy to be used to fetch a valid response
-            get_proxy(session, proxies, validated=True)
-            LOGGER.info('Got Proxy {}'.format(session.proxies['https']))
+            print('Collecting proxy...')
+            proxy = rotating_proxy.get_proxy(validate=True)
+            print('Got Proxy {}'.format(proxy))
             break  # as soon as it fetches a valid response, it will break out of the while loop
         except StopIteration:
             # No more proxies left to try
             raise DepletedProxyPoolException('No more proxies left to try')
         except Exception as e:
-            LOGGER.warning(e)
+            print(e)
             pass  # Other errors: try again
